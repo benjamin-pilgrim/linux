@@ -1061,7 +1061,9 @@ config GPIO_F7188X
 	help
 	  This option enables support for GPIOs found on Fintek Super-I/O
 	  chips F71869, F71869A, F71882FG, F71889F and F81866.
-	  As well as Nuvoton Super-I/O chips NCT6126D and NCT5104D.
+	  As well as Nuvoton Super-I/O chips NCT6126D, NCT5104D and NCT6776.
+	  NCT6776 support covers GPIO7 pins GP70-GP75 already configured
+	  as GPIOs by firmware.
 
 	  To compile this driver as a module, choose M here: the module will
 	  be called f7188x-gpio.
