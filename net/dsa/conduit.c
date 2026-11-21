@@ -402,6 +402,9 @@ int dsa_conduit_setup(struct net_device *dev, struct dsa_port *cpu_dp)
 	if (ret)
 		goto out_err_ethtool_teardown;
 
+	/* The MAC may need different receive checks for switch-tagged frames. */
+	dev_set_rx_mode(dev);
+
 	return ret;
 
 out_err_ethtool_teardown:
@@ -409,6 +412,7 @@ out_err_ethtool_teardown:
 out_err_reset_promisc:
 	dsa_conduit_set_promiscuity(dev, -1);
 	dev->dsa_ptr = NULL;
+	dev_set_rx_mode(dev);
 	return ret;
 }
 
@@ -426,6 +430,8 @@ void dsa_conduit_teardown(struct net_device *dev)
 	 * without the tag and go through the regular receive path.
 	 */
 	wmb();
+
+	dev_set_rx_mode(dev);
 }
 
 int dsa_conduit_lag_setup(struct net_device *lag_dev, struct dsa_port *cpu_dp,
