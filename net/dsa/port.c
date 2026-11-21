@@ -11,6 +11,7 @@
 #include <linux/notifier.h>
 #include <linux/of_mdio.h>
 #include <linux/of_net.h>
+#include <linux/property.h>
 
 #include "dsa.h"
 #include "port.h"
@@ -1622,9 +1623,8 @@ int dsa_port_phylink_create(struct dsa_port *dp)
 	struct phylink *pl;
 	int err;
 
-	err = of_get_phy_mode(dp->dn, &mode);
-	if (err)
-		mode = PHY_INTERFACE_MODE_NA;
+	err = fwnode_get_phy_mode(dp->fwnode);
+	mode = err < 0 ? PHY_INTERFACE_MODE_NA : err;
 
 	if (ds->ops->phylink_get_caps) {
 		ds->ops->phylink_get_caps(ds, dp->index, &dp->pl_config);
@@ -1644,7 +1644,7 @@ int dsa_port_phylink_create(struct dsa_port *dp)
 	if (ds->phylink_mac_ops)
 		mac_ops = ds->phylink_mac_ops;
 
-	pl = phylink_create(&dp->pl_config, of_fwnode_handle(dp->dn), mode,
+	pl = phylink_create(&dp->pl_config, dp->fwnode, mode,
 			    mac_ops);
 	if (IS_ERR(pl)) {
 		pr_err("error creating PHYLINK: %ld\n", PTR_ERR(pl));
@@ -1665,7 +1665,7 @@ void dsa_port_phylink_destroy(struct dsa_port *dp)
 static int dsa_shared_port_phylink_register(struct dsa_port *dp)
 {
 	struct dsa_switch *ds = dp->ds;
-	struct device_node *port_dn = dp->dn;
+	struct fwnode_handle *port_fwnode = dp->fwnode;
 	int err;
 
 	dp->pl_config.dev = ds->dev;
@@ -1675,7 +1675,7 @@ static int dsa_shared_port_phylink_register(struct dsa_port *dp)
 	if (err)
 		return err;
 
-	err = phylink_of_phy_connect(dp->pl, port_dn, 0);
+	err = phylink_fwnode_phy_connect(dp->pl, port_fwnode, 0);
 	if (err && err != -ENODEV) {
 		pr_err("could not attach to PHY: %d\n", err);
 		goto err_phy_connect;
@@ -1848,14 +1848,52 @@ static void dsa_shared_port_link_down(struct dsa_port *dp)
 						   PHY_INTERFACE_MODE_NA);
 }
 
-int dsa_shared_port_link_register_of(struct dsa_port *dp)
+static void dsa_shared_port_validate_fwnode(struct dsa_port *dp,
+					    bool *missing_phy_mode,
+					    bool *missing_link_description)
+{
+	struct fwnode_handle *fwnode = dp->fwnode;
+	struct fwnode_handle *link;
+	const char *managed;
+
+	if (is_of_node(fwnode)) {
+		dsa_shared_port_validate_of(dp, missing_phy_mode,
+					    missing_link_description);
+		return;
+	}
+
+	*missing_phy_mode = fwnode_get_phy_mode(fwnode) < 0;
+	*missing_link_description = false;
+	if (*missing_phy_mode)
+		dev_err(dp->ds->dev, "port %pfw lacks phy-mode\n", fwnode);
+
+	link = fwnode_get_named_child_node(fwnode, "fixed-link");
+	if (link) {
+		fwnode_handle_put(link);
+		return;
+	}
+	if (!fwnode_property_read_string(fwnode, "managed", &managed) &&
+	    !strcmp(managed, "in-band-status"))
+		return;
+
+	link = fwnode_find_reference(fwnode, "phy-handle", 0);
+	if (!IS_ERR(link)) {
+		fwnode_handle_put(link);
+		return;
+	}
+
+	*missing_link_description = true;
+	dev_err(dp->ds->dev, "port %pfw lacks a link description\n", fwnode);
+}
+
+int dsa_shared_port_link_register_fwnode(struct dsa_port *dp)
 {
 	struct dsa_switch *ds = dp->ds;
 	bool missing_link_description;
 	bool missing_phy_mode;
 
-	dsa_shared_port_validate_of(dp, &missing_phy_mode,
-				    &missing_link_description);
+	dsa_shared_port_validate_fwnode(dp, &missing_phy_mode,
+					&missing_link_description);
 
 	if ((missing_phy_mode || missing_link_description) &&
 	    !of_device_compatible_match(ds->dev->of_node,
@@ -1875,7 +1913,7 @@ int dsa_shared_port_link_register_of(struct dsa_port *dp)
 	return 0;
 }
 
-void dsa_shared_port_link_unregister_of(struct dsa_port *dp)
+void dsa_shared_port_link_unregister_fwnode(struct dsa_port *dp)
 {
 	if (dp->pl) {
 		rtnl_lock();

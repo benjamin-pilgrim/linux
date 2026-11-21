@@ -24,6 +24,9 @@
 #include <linux/mdio.h>
 #include <linux/module.h>
 #include <linux/of.h>
+#include <linux/acpi.h>
+#include <linux/acpi_mdio.h>
+#include <linux/fwnode_mdio.h>
 #include <linux/of_irq.h>
 #include <linux/of_mdio.h>
 #include <linux/platform_data/mv88e6xxx.h>
@@ -3372,36 +3375,17 @@ static int mv88e6xxx_setup_upstream_port(struct mv88e6xxx_chip *chip, int port)
 
 static int mv88e6xxx_setup_port(struct mv88e6xxx_chip *chip, int port)
 {
-	struct fwnode_handle *ports_fwnode;
-	struct fwnode_handle *port_fwnode;
 	struct dsa_switch *ds = chip->ds;
 	struct mv88e6xxx_port *p;
 	int err;
 	u16 reg;
-	u32 val;
 
 	p = &chip->ports[port];
 	p->chip = chip;
 	p->port = port;
-
-	/* Look up corresponding fwnode if any */
-	ports_fwnode = device_get_named_child_node(chip->dev, "ethernet-ports");
-	if (!ports_fwnode)
-		ports_fwnode = device_get_named_child_node(chip->dev, "ports");
-	if (ports_fwnode) {
-		fwnode_for_each_child_node(ports_fwnode, port_fwnode) {
-			if (fwnode_property_read_u32(port_fwnode, "reg", &val))
-				continue;
-			if (val == port) {
-				p->fwnode = port_fwnode;
-				p->fiber = fwnode_property_present(port_fwnode, "sfp");
-				break;
-			}
-		}
-		fwnode_handle_put(ports_fwnode);
-	} else {
-		dev_dbg(chip->dev, "no ethernet ports node defined for the device\n");
-	}
+	/* DSA retains the port identity until switch teardown completes. */
+	p->fwnode = dsa_to_port(ds, port)->fwnode;
+	p->fiber = fwnode_property_present(p->fwnode, "sfp");
 
 	if (chip->info->ops->port_setup_leds) {
 		err = chip->info->ops->port_setup_leds(chip, port);
@@ -3840,8 +3824,55 @@ static int mv88e6xxx_mdio_write_c45(struct mii_bus *bus, int phy, int devad,
 	return err;
 }
 
+/* Preserve OF/ACPI enumeration; software nodes describe explicit PHY addresses. */
+static int mv88e6xxx_mdiobus_register(struct mii_bus *bus,
+				      struct fwnode_handle *fwnode)
+{
+	struct fwnode_handle *child;
+	u32 addr, phy_id;
+	int err;
+
+	if (!fwnode || is_of_node(fwnode))
+		return of_mdiobus_register(bus, to_of_node(fwnode));
+	if (is_acpi_node(fwnode))
+		return acpi_mdiobus_register(bus, fwnode);
+
+	bus->phy_mask = ~0;
+	device_set_node(&bus->dev, fwnode);
+	err = mdiobus_register(bus);
+	if (err)
+		return err;
+
+	fwnode_for_each_available_child_node(fwnode, child) {
+		err = fwnode_property_read_u32(child, "reg", &addr);
+		if (err)
+			goto unregister;
+		if (addr >= PHY_MAX_ADDR) {
+			err = -EINVAL;
+			goto unregister;
+		}
+		if (fwnode_property_present(child, "compatible") &&
+		    fwnode_get_phy_id(child, &phy_id) &&
+		    !fwnode_device_is_compatible(child, "ethernet-phy-ieee802.3-c22") &&
+		    !fwnode_device_is_compatible(child, "ethernet-phy-ieee802.3-c45")) {
+			err = -EOPNOTSUPP;
+			goto unregister;
+		}
+		err = fwnode_mdiobus_register_phy(bus, child, addr);
+		if (err)
+			goto unregister;
+	}
+
+	return 0;
+
+unregister:
+	fwnode_handle_put(child);
+	mdiobus_unregister(bus);
+	return err;
+}
+
 static int mv88e6xxx_mdio_register(struct mv88e6xxx_chip *chip,
-				   struct device_node *np,
+				   struct fwnode_handle *fwnode,
 				   bool external)
 {
 	static int index;
@@ -3871,9 +3902,9 @@ static int mv88e6xxx_mdio_register(struct mv88e6xxx_chip *chip,
 	INIT_LIST_HEAD(&mdio_bus->list);
 	mdio_bus->external = external;
 
-	if (np) {
-		bus->name = np->full_name;
-		snprintf(bus->id, MII_BUS_ID_SIZE, "%pOF", np);
+	if (is_of_node(fwnode)) {
+		bus->name = to_of_node(fwnode)->full_name;
+		snprintf(bus->id, MII_BUS_ID_SIZE, "%pOF", to_of_node(fwnode));
 	} else {
 		bus->name = "mv88e6xxx SMI";
 		snprintf(bus->id, MII_BUS_ID_SIZE, "mv88e6xxx-%d", index++);
@@ -3894,7 +3925,7 @@ static int mv88e6xxx_mdio_register(struct mv88e6xxx_chip *chip,
 			goto out;
 	}
 
-	err = of_mdiobus_register(bus, np);
+	err = mv88e6xxx_mdiobus_register(bus, fwnode);
 	if (err) {
 		dev_err(chip->dev, "Cannot register MDIO bus (%d)\n", err);
 		mv88e6xxx_g2_irq_mdio_free(chip, bus);
@@ -3932,31 +3963,23 @@ static void mv88e6xxx_mdios_unregister(struct mv88e6xxx_chip *chip)
 
 static int mv88e6xxx_mdios_register(struct mv88e6xxx_chip *chip)
 {
-	struct device_node *np = chip->dev->of_node;
-	struct device_node *child;
+	struct fwnode_handle *fwnode = dev_fwnode(chip->dev);
+	struct fwnode_handle *child;
 	int err;
 
-	/* Always register one mdio bus for the internal/default mdio
-	 * bus. This maybe represented in the device tree, but is
-	 * optional.
-	 */
-	child = of_get_child_by_name(np, "mdio");
+	/* The internal/default bus description remains optional. */
+	child = fwnode_get_named_child_node(fwnode, "mdio");
 	err = mv88e6xxx_mdio_register(chip, child, false);
-	of_node_put(child);
+	fwnode_handle_put(child);
 	if (err)
 		return err;
 
-	/* Walk the device tree, and see if there are any other nodes
-	 * which say they are compatible with the external mdio
-	 * bus.
-	 */
-	for_each_available_child_of_node(np, child) {
-		if (of_device_is_compatible(
-			    child, "marvell,mv88e6xxx-mdio-external")) {
+	fwnode_for_each_available_child_node(fwnode, child) {
+		if (fwnode_device_is_compatible(child, "marvell,mv88e6xxx-mdio-external")) {
 			err = mv88e6xxx_mdio_register(chip, child, true);
 			if (err) {
 				mv88e6xxx_mdios_unregister(chip);
-				of_node_put(child);
+				fwnode_handle_put(child);
 				return err;
 			}
 		}
@@ -7351,17 +7374,30 @@ static void mv88e6xxx_unregister_switch(struct mv88e6xxx_chip *chip)
 	dsa_unregister_switch(chip->ds);
 }
 
-static const void *pdata_device_get_match_data(struct device *dev)
+static const void *mv88e6xxx_get_match_data(struct device *dev)
 {
 	const struct of_device_id *matches = dev->driver->of_match_table;
 	const struct dsa_mv88e6xxx_pdata *pdata = dev->platform_data;
+	const void *data = NULL;
+	int best = INT_MAX, index;
+
+	if (!pdata && dev_of_node(dev))
+		return of_device_get_match_data(dev);
 
 	for (; matches->name[0] || matches->type[0] || matches->compatible[0];
 	     matches++) {
-		if (!strcmp(pdata->compatible, matches->compatible))
-			return matches->data;
+		if (pdata) {
+			if (!strcmp(pdata->compatible, matches->compatible))
+				return matches->data;
+			continue;
+		}
+		index = device_property_match_string(dev, "compatible", matches->compatible);
+		if (index >= 0 && index < best) {
+			best = index;
+			data = matches->data;
+		}
 	}
-	return NULL;
+	return data;
 }
 
 /* There is no suspend to RAM support at DSA level yet, the switch configuration
@@ -7389,15 +7425,12 @@ static int mv88e6xxx_probe(struct mdio_device *mdiodev)
 	int port;
 	int err;
 
-	if (!np && !pdata)
+	if (!dev_fwnode(dev) && !pdata)
 		return -EINVAL;
 
-	if (np)
-		compat_info = of_device_get_match_data(dev);
+	compat_info = mv88e6xxx_get_match_data(dev);
 
 	if (pdata) {
-		compat_info = pdata_device_get_match_data(dev);
-
 		if (!pdata->netdev)
 			return -EINVAL;
 
@@ -7452,9 +7485,9 @@ static int mv88e6xxx_probe(struct mdio_device *mdiodev)
 	mv88e6xxx_phy_init(chip);
 
 	if (chip->info->ops->get_eeprom) {
-		if (np)
-			of_property_read_u32(np, "eeprom-length",
-					     &chip->eeprom_len);
+		if (dev_fwnode(dev))
+			device_property_read_u32(dev, "eeprom-length",
+						 &chip->eeprom_len);
 		else
 			chip->eeprom_len = pdata->eeprom_len;
 	}
