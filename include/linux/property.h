@@ -329,18 +329,26 @@ struct software_node;
 /**
  * struct software_node_ref_args - Reference property with additional arguments
  * @node: Reference to a software node
+ * @fwnode: Alternative reference to an existing firmware node
  * @nargs: Number of elements in @args array
  * @args: Integer arguments
  */
 struct software_node_ref_args {
 	const struct software_node *node;
+	struct fwnode_handle *fwnode;
 	unsigned int nargs;
 	u64 args[NR_FWNODE_REFERENCE_ARGS];
 };
 
 #define SOFTWARE_NODE_REFERENCE(_ref_, ...)			\
 (const struct software_node_ref_args) {				\
-	.node = _ref_,						\
+	.node = _Generic(_ref_,				\
+			   const struct software_node *: _ref_,	\
+			   struct software_node *: _ref_,	\
+			   default: NULL),			\
+	.fwnode = _Generic(_ref_,				\
+			   struct fwnode_handle *: _ref_,	\
+			   default: NULL),			\
 	.nargs = COUNT_ARGS(__VA_ARGS__),			\
 	.args = { __VA_ARGS__ },				\
 }
