@@ -16,6 +16,8 @@
 #include <linux/rtnetlink.h>
 #include <linux/of.h>
 #include <linux/of_net.h>
+#include <linux/property.h>
+#include <net/net_namespace.h>
 #include <net/dsa_stubs.h>
 #include <net/sch_generic.h>
 
@@ -272,13 +274,13 @@ static void dsa_tree_put(struct dsa_switch_tree *dst)
 		kref_put(&dst->refcount, dsa_tree_release);
 }
 
-static struct dsa_port *dsa_tree_find_port_by_node(struct dsa_switch_tree *dst,
-						   struct device_node *dn)
+static struct dsa_port *dsa_tree_find_port_by_fwnode(struct dsa_switch_tree *dst,
+						     struct fwnode_handle *fwnode)
 {
 	struct dsa_port *dp;
 
 	list_for_each_entry(dp, &dst->ports, list)
-		if (dp->dn == dn)
+		if (dp->fwnode == fwnode)
 			return dp;
 
 	return NULL;
@@ -320,8 +322,23 @@ static bool dsa_port_setup_routing_table(struct dsa_port *dp)
 	struct dsa_link *dl;
 	int err;
 
+	if (!is_of_node(dp->fwnode)) {
+		struct fwnode_handle *link;
+		int i;
+
+		for (i = 0; ; i++) {
+			link = fwnode_find_reference(dp->fwnode, "link", i);
+			if (IS_ERR(link))
+				return PTR_ERR(link) == -ENOENT;
+			link_dp = dsa_tree_find_port_by_fwnode(dst, link);
+			fwnode_handle_put(link);
+			if (!link_dp || !dsa_link_touch(dp, link_dp))
+				return false;
+		}
+	}
+
 	of_for_each_phandle(&it, err, dn, "link", NULL, 0) {
-		link_dp = dsa_tree_find_port_by_node(dst, it.node);
+		link_dp = dsa_tree_find_port_by_fwnode(dst, of_fwnode_handle(it.node));
 		if (!link_dp) {
 			of_node_put(it.node);
 			return false;
@@ -473,8 +490,8 @@ static int dsa_port_setup(struct dsa_port *dp)
 		dsa_port_disable(dp);
 		break;
 	case DSA_PORT_TYPE_CPU:
-		if (dp->dn) {
-			err = dsa_shared_port_link_register_of(dp);
+		if (dp->fwnode) {
+			err = dsa_shared_port_link_register_fwnode(dp);
 			if (err)
 				break;
 			dsa_port_link_registered = true;
@@ -491,8 +508,8 @@ static int dsa_port_setup(struct dsa_port *dp)
 
 		break;
 	case DSA_PORT_TYPE_DSA:
-		if (dp->dn) {
-			err = dsa_shared_port_link_register_of(dp);
+		if (dp->fwnode) {
+			err = dsa_shared_port_link_register_fwnode(dp);
 			if (err)
 				break;
 			dsa_port_link_registered = true;
@@ -509,7 +526,10 @@ static int dsa_port_setup(struct dsa_port *dp)
 
 		break;
 	case DSA_PORT_TYPE_USER:
-		of_get_mac_address(dp->dn, dp->mac);
+		if (is_of_node(dp->fwnode))
+			of_get_mac_address(dp->dn, dp->mac);
+		else
+			fwnode_get_mac_address(dp->fwnode, dp->mac);
 		err = dsa_user_create(dp);
 		break;
 	}
@@ -517,7 +537,7 @@ static int dsa_port_setup(struct dsa_port *dp)
 	if (err && dsa_port_enabled)
 		dsa_port_disable(dp);
 	if (err && dsa_port_link_registered)
-		dsa_shared_port_link_unregister_of(dp);
+		dsa_shared_port_link_unregister_fwnode(dp);
 	if (err) {
 		dsa_port_devlink_teardown(dp);
 		return err;
@@ -538,13 +558,13 @@ static void dsa_port_teardown(struct dsa_port *dp)
 		break;
 	case DSA_PORT_TYPE_CPU:
 		dsa_port_disable(dp);
-		if (dp->dn)
-			dsa_shared_port_link_unregister_of(dp);
+		if (dp->fwnode)
+			dsa_shared_port_link_unregister_fwnode(dp);
 		break;
 	case DSA_PORT_TYPE_DSA:
 		dsa_port_disable(dp);
-		if (dp->dn)
-			dsa_shared_port_link_unregister_of(dp);
+		if (dp->fwnode)
+			dsa_shared_port_link_unregister_fwnode(dp);
 		break;
 	case DSA_PORT_TYPE_USER:
 		if (dp->user) {
@@ -1235,93 +1255,131 @@ static int dsa_port_parse_cpu(struct dsa_port *dp, struct net_device *conduit,
 	return 0;
 }
 
-static int dsa_port_parse_of(struct dsa_port *dp, struct device_node *dn)
+/* Called under RTNL; the caller takes its tracked reference before unlock. */
+static struct net_device *dsa_conduit_find_by_fwnode(struct fwnode_handle *fwnode)
 {
-	struct device_node *ethernet = of_parse_phandle(dn, "ethernet", 0);
-	const char *name = of_get_property(dn, "label", NULL);
-	bool link = of_property_read_bool(dn, "link");
+	struct net_device *ndev, *found = NULL;
+	struct device *parent;
 
-	dp->dn = dn;
-
-	if (ethernet) {
-		struct net_device *conduit;
-		const char *user_protocol;
-
-		conduit = of_find_net_device_by_node(ethernet);
-		of_node_put(ethernet);
-		if (!conduit)
-			return -EPROBE_DEFER;
-
-		user_protocol = of_get_property(dn, "dsa-tag-protocol", NULL);
-		return dsa_port_parse_cpu(dp, conduit, user_protocol);
+	ASSERT_RTNL();
+	for_each_netdev(&init_net, ndev) {
+		for (parent = &ndev->dev; parent; parent = parent->parent) {
+			if (!device_match_fwnode(parent, fwnode))
+				continue;
+			if (found)
+				return ERR_PTR(-ENOTUNIQ);
+			found = ndev;
+			break;
+		}
 	}
 
-	if (link)
+	return found ?: ERR_PTR(-EPROBE_DEFER);
+}
+
+static int dsa_port_parse_fwnode(struct dsa_port *dp,
+				 struct fwnode_handle *fwnode)
+{
+	struct fwnode_handle *ethernet;
+	const char *name = NULL;
+
+	dp->fwnode = fwnode_handle_get(fwnode);
+	dp->dn = to_of_node(fwnode);
+	fwnode_property_read_string(fwnode, "label", &name);
+
+	ethernet = fwnode_find_reference(fwnode, "ethernet", 0);
+	if (!IS_ERR(ethernet)) {
+		const char *user_protocol = NULL;
+		struct net_device *conduit;
+		int err;
+
+		rtnl_lock();
+		conduit = dsa_conduit_find_by_fwnode(ethernet);
+		fwnode_handle_put(ethernet);
+		if (IS_ERR(conduit)) {
+			rtnl_unlock();
+			return PTR_ERR(conduit);
+		}
+
+		netdev_hold(conduit, &dp->conduit_tracker, GFP_KERNEL);
+		rtnl_unlock();
+
+		fwnode_property_read_string(fwnode, "dsa-tag-protocol",
+					    &user_protocol);
+		err = dsa_port_parse_cpu(dp, conduit, user_protocol);
+		if (err)
+			netdev_put(conduit, &dp->conduit_tracker);
+		return err;
+	}
+
+	if (fwnode_property_present(fwnode, "ethernet"))
+		return PTR_ERR(ethernet);
+
+	if (fwnode_property_present(fwnode, "link"))
 		return dsa_port_parse_dsa(dp);
 
 	return dsa_port_parse_user(dp, name);
 }
 
-static int dsa_switch_parse_ports_of(struct dsa_switch *ds,
-				     struct device_node *dn)
+static int dsa_switch_parse_ports_fwnode(struct dsa_switch *ds,
+					 struct fwnode_handle *fwnode)
 {
-	struct device_node *ports, *port;
+	struct fwnode_handle *ports, *port;
 	struct dsa_port *dp;
 	int err = 0;
 	u32 reg;
 
-	ports = of_get_child_by_name(dn, "ports");
+	ports = fwnode_get_named_child_node(fwnode, "ports");
+	if (!ports)
+		ports = fwnode_get_named_child_node(fwnode, "ethernet-ports");
 	if (!ports) {
-		/* The second possibility is "ethernet-ports" */
-		ports = of_get_child_by_name(dn, "ethernet-ports");
-		if (!ports) {
-			dev_err(ds->dev, "no ports child node found\n");
-			return -EINVAL;
-		}
+		dev_err(ds->dev, "no ports child node found\n");
+		return -EINVAL;
 	}
 
-	for_each_available_child_of_node(ports, port) {
-		err = of_property_read_u32(port, "reg", &reg);
-		if (err) {
-			of_node_put(port);
-			goto out_put_node;
-		}
+	fwnode_for_each_available_child_node(ports, port) {
+		err = fwnode_property_read_u32(port, "reg", &reg);
+		if (err)
+			goto out_put_port;
 
 		if (reg >= ds->num_ports) {
-			dev_err(ds->dev, "port %pOF index %u exceeds num_ports (%u)\n",
+			dev_err(ds->dev, "port %pfw index %u exceeds num_ports (%u)\n",
 				port, reg, ds->num_ports);
-			of_node_put(port);
 			err = -EINVAL;
-			goto out_put_node;
+			goto out_put_port;
 		}
 
 		dp = dsa_to_port(ds, reg);
-
-		err = dsa_port_parse_of(dp, port);
-		if (err) {
-			of_node_put(port);
-			goto out_put_node;
+		if (dp->fwnode) {
+			err = -EINVAL;
+			goto out_put_port;
 		}
-	}
 
-out_put_node:
-	of_node_put(ports);
+		err = dsa_port_parse_fwnode(dp, port);
+		if (err)
+			goto out_put_port;
+	}
+	goto out_put_ports;
+
+out_put_port:
+	fwnode_handle_put(port);
+out_put_ports:
+	fwnode_handle_put(ports);
 	return err;
 }
 
-static int dsa_switch_parse_member_of(struct dsa_switch *ds,
-				      struct device_node *dn)
+static int dsa_switch_parse_member_fwnode(struct dsa_switch *ds,
+					  struct fwnode_handle *fwnode)
 {
 	u32 m[2] = { 0, 0 };
-	int sz;
+	int err;
 
-	/* Don't error out if this optional property isn't found */
-	sz = of_property_read_variable_u32_array(dn, "dsa,member", m, 2, 2);
-	if (sz < 0 && sz != -EINVAL)
-		return sz;
+	if (fwnode_property_present(fwnode, "dsa,member")) {
+		err = fwnode_property_read_u32_array(fwnode, "dsa,member", m, 2);
+		if (err)
+			return err;
+	}
 
 	ds->index = m[1];
-
 	ds->dst = dsa_tree_touch(m[0]);
 	if (!ds->dst)
 		return -ENOMEM;
@@ -1353,11 +1411,12 @@ static int dsa_switch_touch_ports(struct dsa_switch *ds)
 	return 0;
 }
 
-static int dsa_switch_parse_of(struct dsa_switch *ds, struct device_node *dn)
+static int dsa_switch_parse_fwnode(struct dsa_switch *ds,
+				   struct fwnode_handle *fwnode)
 {
 	int err;
 
-	err = dsa_switch_parse_member_of(ds, dn);
+	err = dsa_switch_parse_member_fwnode(ds, fwnode);
 	if (err)
 		return err;
 
@@ -1365,7 +1424,7 @@ static int dsa_switch_parse_of(struct dsa_switch *ds, struct device_node *dn)
 	if (err)
 		return err;
 
-	return dsa_switch_parse_ports_of(ds, dn);
+	return dsa_switch_parse_ports_fwnode(ds, fwnode);
 }
 
 static int dev_is_class(struct device *dev, void *class)
@@ -1484,6 +1543,9 @@ static void dsa_switch_release_ports(struct dsa_switch *ds)
 	struct dsa_vlan *v, *n;
 
 	dsa_switch_for_each_port_safe(dp, next, ds) {
+		if (dsa_port_is_cpu(dp) && dp->fwnode && dp->conduit)
+			netdev_put(dp->conduit, &dp->conduit_tracker);
+
 		/* These are either entries that upper layers lost track of
 		 * (probably due to bugs), or installed through interfaces
 		 * where one does not necessarily have to remove them, like
@@ -1518,6 +1580,7 @@ static void dsa_switch_release_ports(struct dsa_switch *ds)
 		}
 
 		list_del(&dp->list);
+		fwnode_handle_put(dp->fwnode);
 		kfree(dp);
 	}
 }
@@ -1526,14 +1589,14 @@ static int dsa_switch_probe(struct dsa_switch *ds)
 {
 	struct dsa_switch_tree *dst;
 	struct dsa_chip_data *pdata;
-	struct device_node *np;
+	struct fwnode_handle *fwnode;
 	int err;
 
 	if (!ds->dev)
 		return -ENODEV;
 
 	pdata = ds->dev->platform_data;
-	np = ds->dev->of_node;
+	fwnode = dev_fwnode(ds->dev);
 
 	if (!ds->num_ports)
 		return -EINVAL;
@@ -1546,8 +1609,8 @@ static int dsa_switch_probe(struct dsa_switch *ds)
 			return -EINVAL;
 	}
 
-	if (np) {
-		err = dsa_switch_parse_of(ds, np);
+	if (fwnode) {
+		err = dsa_switch_parse_fwnode(ds, fwnode);
 		if (err)
 			dsa_switch_release_ports(ds);
 	} else if (pdata) {

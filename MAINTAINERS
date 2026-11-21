@@ -24916,6 +24916,13 @@ F:	include/linux/watchdog.h
 F:	include/trace/events/watchdog.h
 F:	include/uapi/linux/watchdog.h
 
+WATCHGUARD BOARD SUPPORT
+M:	Ben <1783166+benjamin-pilgrim@users.noreply.github.com>
+L:	platform-driver-x86@vger.kernel.org
+L:	netdev@vger.kernel.org
+S:	Maintained
+F:	drivers/platform/x86/watchguard/
+
 WAVE5 VPU CODEC DRIVER
 M:	Nas Chung <nas.chung@chipsnmedia.com>
 M:	Jackson Lee <jackson.lee@chipsnmedia.com>

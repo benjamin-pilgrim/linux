@@ -8859,6 +8859,7 @@ void dev_set_rx_mode(struct net_device *dev)
 	__dev_set_rx_mode(dev);
 	netif_addr_unlock_bh(dev);
 }
+EXPORT_SYMBOL_GPL(dev_set_rx_mode);
 
 /**
  *	dev_get_flags - get flags reported to userspace
