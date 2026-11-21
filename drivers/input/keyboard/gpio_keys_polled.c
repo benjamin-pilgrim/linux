@@ -96,7 +96,7 @@ static void gpio_keys_polled_poll(struct input_dev *input)
 	for (i = 0; i < pdata->nbuttons; i++) {
 		struct gpio_keys_button_data *bdata = &bdev->data[i];
 
-		if (bdata->count < bdata->threshold) {
+		if (bdata->last_state >= 0 && bdata->count < bdata->threshold) {
 			bdata->count++;
 			gpio_keys_button_event(input, &pdata->buttons[i],
 					       bdata->last_state);
