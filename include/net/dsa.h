@@ -290,6 +290,8 @@ struct dsa_port {
 	u8			setup:1;
 
 	struct device_node	*dn;
+	struct fwnode_handle	*fwnode;
+	netdevice_tracker	conduit_tracker;
 	unsigned int		ageing_time;
 
 	struct dsa_bridge	*bridge;

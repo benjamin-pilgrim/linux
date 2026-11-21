@@ -2594,7 +2594,7 @@ static int dsa_user_phy_connect(struct net_device *user_dev, int addr,
 static int dsa_user_phy_setup(struct net_device *user_dev)
 {
 	struct dsa_port *dp = dsa_user_to_port(user_dev);
-	struct device_node *port_dn = dp->dn;
+	struct fwnode_handle *port_fwnode = dp->fwnode;
 	struct dsa_switch *ds = dp->ds;
 	u32 phy_flags = 0;
 	int ret;
@@ -2618,7 +2618,7 @@ static int dsa_user_phy_setup(struct net_device *user_dev)
 	if (ds->ops->get_phy_flags)
 		phy_flags = ds->ops->get_phy_flags(ds, dp->index);
 
-	ret = phylink_of_phy_connect(dp->pl, port_dn, phy_flags);
+	ret = phylink_fwnode_phy_connect(dp->pl, port_fwnode, phy_flags);
 	if (ret == -ENODEV && ds->user_mii_bus) {
 		/* We could not connect to a designated PHY or SFP, so try to
 		 * use the switch internal MDIO bus instead
@@ -2741,7 +2741,7 @@ int dsa_user_create(struct dsa_port *port)
 
 	SET_NETDEV_DEV(user_dev, port->ds->dev);
 	SET_NETDEV_DEVLINK_PORT(user_dev, &port->devlink_port);
-	user_dev->dev.of_node = port->dn;
+	device_set_node(&user_dev->dev, port->fwnode);
 	user_dev->vlan_features = conduit->vlan_features;
 
 	p = netdev_priv(user_dev);
