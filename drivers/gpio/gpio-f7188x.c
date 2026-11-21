@@ -55,6 +55,16 @@
 #define SIO_NCT5104D_VER_B_ID		0xC452  /* NCT5104D version B chipset ID */
 #define SIO_NCT5104D_VER_C_ID		0xC453  /* NCT5104D version C chipset ID */
 
+#define SIO_NCT6776_ID		0xC333
+#define NCT6776_GPIO7_MUX	0x27
+#define NCT6776_GPIO7_MUX_ENABLE	BIT(7)
+#define NCT6776_GPIO_ENABLE_LD	0x09
+#define NCT6776_GPIO_ENABLE	0x30
+#define NCT6776_GPIO7_ENABLE	BIT(7)
+#define NCT6776_GPIO7_FUNCTION	0xEC
+#define NCT6776_GPIO_MODE_LD	0x0F
+#define NCT6776_GPIO7_MODE	0xE6
+
 #define SIO_LD_GPIO_NUVOTON	0x07	/* GPIO logical device */
 #define SIO_NCT5104D_LD_OUTMODE	0x0F	/* GPIO output mode logical device */
 #define SIO_NCT5104D_MFS	0x1C	/* Multi-function select */
@@ -71,6 +81,7 @@ enum chips {
 	f81865,
 	nct6126d,
 	nct5104d,
+	nct6776,
 };
 
 static const char * const f7188x_names[] = {
@@ -84,6 +95,7 @@ static const char * const f7188x_names[] = {
 	"f81865",
 	"nct6126d",
 	"nct5104d",
+	"nct6776",
 };
 
 struct f7188x_sio {
@@ -203,7 +215,8 @@ static int f7188x_gpio_set_config(struct gpio_chip *chip, unsigned offset,
  */
 #define nct5104d_gpio_out_mode(base) (0xE0 + ((base) - 0xE0) / 4)
 
-#define f7188x_is_nuvoton(type)		((type) == nct6126d || (type) == nct5104d)
+#define f7188x_is_nuvoton(type)		((type) == nct6126d || \
+					 (type) == nct5104d || (type) == nct6776)
 #define f7188x_gpio_dir_invert(type)	f7188x_is_nuvoton(type)
 #define f7188x_gpio_data_single(type)	f7188x_is_nuvoton(type)
 
@@ -307,6 +320,48 @@ static struct f7188x_gpio_bank nct5104d_gpio_bank[] = {
 	F7188X_GPIO_BANK(8, 0xE4, DRVNAME "-1"),
 };
 
+/* GP76/GP77 use different mux controls and are not exposed here. */
+static struct f7188x_gpio_bank nct6776_gpio_bank[] = {
+	F7188X_GPIO_BANK(6, 0xE0, DRVNAME "-7"),
+};
+
+static int nct6776_gpio_request(struct gpio_chip *chip, unsigned int offset)
+{
+	struct f7188x_gpio_bank *bank = gpiochip_get_data(chip);
+	struct f7188x_sio *sio = bank->data->sio;
+	int err;
+
+	err = superio_enter(sio->addr);
+	if (err)
+		return err;
+	/* Leave firmware pin multiplexing and bank activation unchanged. */
+	if (!(superio_inb(sio->addr, NCT6776_GPIO7_MUX) & NCT6776_GPIO7_MUX_ENABLE)) {
+		err = -EBUSY;
+		goto exit;
+	}
+	superio_select(sio->addr, NCT6776_GPIO_ENABLE_LD);
+	if (!(superio_inb(sio->addr, NCT6776_GPIO_ENABLE) & NCT6776_GPIO7_ENABLE)) {
+		err = -EBUSY;
+		goto exit;
+	}
+	superio_select(sio->addr, sio->device);
+	if (superio_inb(sio->addr, NCT6776_GPIO7_FUNCTION) & BIT(offset))
+		err = -EBUSY;
+exit:
+	superio_exit(sio->addr);
+	return err;
+}
+
+/* Translate the NCT6776's configurable data inversion to physical levels. */
+static u8 f7188x_gpio_inversion(struct f7188x_gpio_bank *bank)
+{
+	struct f7188x_sio *sio = bank->data->sio;
+
+	if (sio->type == nct6776)
+		return superio_inb(sio->addr, bank->regbase + 2);
+	return 0;
+}
+
 static int f7188x_gpio_get_direction(struct gpio_chip *chip, unsigned offset)
 {
 	int err;
@@ -376,6 +431,8 @@ static int f7188x_gpio_get(struct gpio_chip *chip, unsigned offset)
 	else
 		data = superio_inb(sio->addr, f7188x_gpio_data_in(bank->regbase));
 
+	data ^= f7188x_gpio_inversion(bank);
+
 	superio_exit(sio->addr);
 
 	return !!(data & BIT(offset));
@@ -395,6 +452,7 @@ static int f7188x_gpio_direction_out(struct gpio_chip *chip,
 	superio_select(sio->addr, sio->device);
 
 	data_out = superio_inb(sio->addr, f7188x_gpio_data_out(bank->regbase));
+	value = !!value ^ !!(f7188x_gpio_inversion(bank) & BIT(offset));
 	if (value)
 		data_out |= BIT(offset);
 	else
@@ -428,6 +486,7 @@ static int f7188x_gpio_set(struct gpio_chip *chip, unsigned int offset,
 	superio_select(sio->addr, sio->device);
 
 	data_out = superio_inb(sio->addr, f7188x_gpio_data_out(bank->regbase));
+	value = !!value ^ !!(f7188x_gpio_inversion(bank) & BIT(offset));
 	if (value)
 		data_out |= BIT(offset);
 	else
@@ -469,6 +528,22 @@ static void __nct5104d_gpio_set_out_mode(struct f7188x_gpio_bank *bank,
 	superio_outb(sio->addr, nct5104d_gpio_out_mode(bank->regbase), data);
 }
 
+static void __nct6776_gpio_set_out_mode(struct f7188x_gpio_bank *bank,
+				      unsigned int offset, bool open_drain)
+{
+	struct f7188x_sio *sio = bank->data->sio;
+	u8 data;
+
+	/* LDN7:E3 is read-to-clear event status, not output mode. */
+	superio_select(sio->addr, NCT6776_GPIO_MODE_LD);
+	data = superio_inb(sio->addr, NCT6776_GPIO7_MODE);
+	if (open_drain)
+		data |= BIT(offset);
+	else
+		data &= ~BIT(offset);
+	superio_outb(sio->addr, NCT6776_GPIO7_MODE, data);
+}
+
 static int f7188x_gpio_set_config(struct gpio_chip *chip, unsigned offset,
 				  unsigned long config)
 {
@@ -487,7 +562,9 @@ static int f7188x_gpio_set_config(struct gpio_chip *chip, unsigned offset,
 	if (err)
 		return err;
 
-	if (sio->type == nct5104d)
+	if (sio->type == nct6776)
+		__nct6776_gpio_set_out_mode(bank, offset, open_drain);
+	else if (sio->type == nct5104d)
 		__nct5104d_gpio_set_out_mode(bank, offset, open_drain);
 	else
 		__f7188x_gpio_set_out_mode(bank, offset, open_drain);
@@ -548,6 +625,11 @@ static int f7188x_gpio_probe(struct platform_device *pdev)
 	case nct6126d:
 		data->nr_bank = ARRAY_SIZE(nct6126d_gpio_bank);
 		data->bank = nct6126d_gpio_bank;
+		break;
+	case nct6776:
+		data->nr_bank = ARRAY_SIZE(nct6776_gpio_bank);
+		data->bank = nct6776_gpio_bank;
+		data->bank[0].chip.request = nct6776_gpio_request;
 		break;
 	case nct5104d:
 		data->nr_bank = ARRAY_SIZE(nct5104d_gpio_bank);
@@ -639,6 +721,10 @@ static int __init f7188x_find(int addr, struct f7188x_sio *sio)
 		break;
 	case SIO_F81865_ID:
 		sio->type = f81865;
+		break;
+	case SIO_NCT6776_ID:
+		sio->device = SIO_LD_GPIO_NUVOTON;
+		sio->type = nct6776;
 		break;
 	case SIO_NCT6126D_VER_A_ID:
 	case SIO_NCT6126D_VER_B_ID:
