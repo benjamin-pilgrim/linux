@@ -658,7 +658,13 @@ void ixgbe_release_swfw_sync_X540(struct ixgbe_hw *hw, u32 mask)
 	IXGBE_WRITE_REG(hw, IXGBE_SWFW_SYNC(hw), swfw_sync);
 
 	ixgbe_release_swfw_sync_semaphore(hw);
-	usleep_range(5000, 6000);
+	/* Keep NVM and mixed-resource accesses on the original delay. */
+	if (hw->mac.type == ixgbe_mac_x550em_a && mask &&
+	    !(mask & ~(IXGBE_GSSR_PHY0_SM | IXGBE_GSSR_PHY1_SM |
+		       IXGBE_GSSR_SW_MNG_SM)))
+		usleep_range(10, 20);
+	else
+		usleep_range(5000, 6000);
 }
 
 /**
