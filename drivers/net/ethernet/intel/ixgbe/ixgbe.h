@@ -756,6 +756,7 @@ struct ixgbe_adapter {
 
 	u32 link_speed;
 	bool link_up;
+	bool dsa_rx_len_check_disabled;
 	unsigned long sfp_poll_time;
 	unsigned long link_check_timeout;
 	u32 link_down_events;
