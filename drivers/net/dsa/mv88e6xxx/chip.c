@@ -1519,6 +1519,24 @@ static int mv88e6xxx_set_mac_eee(struct dsa_switch *ds, int port,
 	return 0;
 }
 
+/* Experimental ordinary-traffic affinity; global trap destinations stay shared. */
+static bool mv88e6xxx_cpu_affinity_supported(struct mv88e6xxx_chip *chip)
+{
+	return chip->info->prod_num == MV88E6XXX_PORT_SWITCH_ID_PROD_6190 &&
+	       chip->ds->index == 0 && chip->ds->dst->last_switch == 0;
+}
+
+static u16 mv88e6xxx_cpu_port_mask(struct dsa_switch *ds)
+{
+	struct dsa_port *dp;
+	u16 mask = 0;
+
+	dsa_switch_for_each_cpu_port(dp, ds)
+		mask |= BIT(dp->index);
+
+	return mask;
+}
+
 /* Mask of the local ports allowed to receive frames from a given fabric port */
 static u16 mv88e6xxx_port_vlan(struct mv88e6xxx_chip *chip, int dev, int port)
 {
@@ -1569,8 +1587,11 @@ static u16 mv88e6xxx_port_vlan(struct mv88e6xxx_chip *chip, int dev, int port)
 	/* Frames from standalone user ports can only egress on the
 	 * upstream port.
 	 */
-	if (!dsa_port_bridge_dev_get(dp))
+	if (!dsa_port_bridge_dev_get(dp)) {
+		if (mv88e6xxx_cpu_affinity_supported(chip))
+			return BIT(dp->cpu_dp->index);
 		return BIT(dsa_switch_upstream_port(ds));
+	}
 
 	/* Frames from bridged user ports can egress any local DSA
 	 * links and CPU ports, as well as any local member of their
@@ -1581,6 +1602,11 @@ static u16 mv88e6xxx_port_vlan(struct mv88e6xxx_chip *chip, int dev, int port)
 		    other_dp->type == DSA_PORT_TYPE_DSA ||
 		    dsa_port_bridge_same(dp, other_dp))
 			pvlan |= BIT(other_dp->index);
+
+	if (mv88e6xxx_cpu_affinity_supported(chip)) {
+		pvlan &= ~mv88e6xxx_cpu_port_mask(ds);
+		pvlan |= BIT(dp->cpu_dp->index);
+	}
 
 	return pvlan;
 }
@@ -1593,6 +1619,43 @@ static int mv88e6xxx_port_vlan_map(struct mv88e6xxx_chip *chip, int port)
 	output_ports &= ~BIT(port);
 
 	return mv88e6xxx_port_set_vlan_map(chip, port, output_ports);
+}
+
+static int mv88e6xxx_port_change_conduit(struct dsa_switch *ds, int port,
+					 struct net_device *conduit,
+					 struct netlink_ext_ack *extack)
+{
+	struct mv88e6xxx_chip *chip = ds->priv;
+	struct dsa_port *cpu_dp = conduit->dsa_ptr;
+	u16 map;
+	int err;
+
+	if (!mv88e6xxx_cpu_affinity_supported(chip)) {
+		NL_SET_ERR_MSG_MOD(extack,
+				   "Experimental CPU affinity requires a single 88E6190");
+		return -EOPNOTSUPP;
+	}
+
+	if (netif_is_lag_master(conduit)) {
+		NL_SET_ERR_MSG_MOD(extack, "CPU link aggregation is not supported");
+		return -EOPNOTSUPP;
+	}
+
+	if (cpu_dp->ds != ds) {
+		NL_SET_ERR_MSG_MOD(extack, "CPU port must be on the same switch");
+		return -EOPNOTSUPP;
+	}
+
+	mv88e6xxx_reg_lock(chip);
+	map = mv88e6xxx_port_vlan(chip, ds->index, port);
+	/* DSA publishes the new cpu_dp only after this callback succeeds. */
+	map &= ~mv88e6xxx_cpu_port_mask(ds);
+	map |= BIT(cpu_dp->index);
+	map &= ~BIT(port);
+	err = mv88e6xxx_port_set_vlan_map(chip, port, map);
+	mv88e6xxx_reg_unlock(chip);
+
+	return err;
 }
 
 static void mv88e6xxx_port_stp_state_set(struct dsa_switch *ds, int port,
@@ -2291,10 +2354,20 @@ static int mv88e6xxx_port_db_load_purge(struct mv88e6xxx_chip *chip, int port,
 		if (!entry.portvec)
 			entry.state = 0;
 	} else {
-		if (state == MV88E6XXX_G1_ATU_DATA_STATE_UC_STATIC)
-			entry.portvec = BIT(port);
-		else
+		if (state == MV88E6XXX_G1_ATU_DATA_STATE_UC_STATIC) {
+			/* Host MACs may serve bridged ports on both CPU links.
+			 * User MAC moves must still replace the old destination.
+			 */
+			if (mv88e6xxx_cpu_affinity_supported(chip) &&
+			    dsa_is_cpu_port(chip->ds, port) && !entry.trunk)
+				entry.portvec &= mv88e6xxx_cpu_port_mask(chip->ds);
+			else
+				entry.portvec = 0;
+			entry.trunk = false;
 			entry.portvec |= BIT(port);
+		} else {
+			entry.portvec |= BIT(port);
+		}
 
 		entry.state = state;
 	}
@@ -7290,6 +7363,7 @@ static const struct dsa_switch_ops mv88e6xxx_switch_ops = {
 	.port_vlan_add		= mv88e6xxx_port_vlan_add,
 	.port_vlan_del		= mv88e6xxx_port_vlan_del,
 	.vlan_msti_set		= mv88e6xxx_vlan_msti_set,
+	.port_change_conduit	= mv88e6xxx_port_change_conduit,
 	.port_fdb_add		= mv88e6xxx_port_fdb_add,
 	.port_fdb_del		= mv88e6xxx_port_fdb_del,
 	.port_fdb_dump		= mv88e6xxx_port_fdb_dump,
