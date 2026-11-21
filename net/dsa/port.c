@@ -1063,7 +1063,11 @@ int dsa_port_bridge_host_fdb_add(struct dsa_port *dp,
 			return err;
 	}
 
-	return dsa_port_host_fdb_add(dp, addr, vid, db);
+	err = dsa_port_host_fdb_add(dp, addr, vid, db);
+	if (err && (conduit->priv_flags & IFF_UNICAST_FLT))
+		dev_uc_del(conduit, addr);
+
+	return err;
 }
 
 static int dsa_port_host_fdb_del(struct dsa_port *dp,
@@ -1104,13 +1108,14 @@ int dsa_port_bridge_host_fdb_del(struct dsa_port *dp,
 	if (!dp->ds->fdb_isolation)
 		db.bridge.num = 0;
 
-	if (conduit->priv_flags & IFF_UNICAST_FLT) {
-		err = dev_uc_del(conduit, addr);
-		if (err)
-			return err;
-	}
+	err = dsa_port_host_fdb_del(dp, addr, vid, db);
+	if (err)
+		return err;
 
-	return dsa_port_host_fdb_del(dp, addr, vid, db);
+	if (conduit->priv_flags & IFF_UNICAST_FLT)
+		return dev_uc_del(conduit, addr);
+
+	return 0;
 }
 
 int dsa_port_lag_fdb_add(struct dsa_port *dp, const unsigned char *addr,
@@ -1239,7 +1244,11 @@ int dsa_port_bridge_host_mdb_add(const struct dsa_port *dp,
 	if (err)
 		return err;
 
-	return dsa_port_host_mdb_add(dp, mdb, db);
+	err = dsa_port_host_mdb_add(dp, mdb, db);
+	if (err)
+		dev_mc_del(conduit, mdb->addr);
+
+	return err;
 }
 
 static int dsa_port_host_mdb_del(const struct dsa_port *dp,
@@ -1279,11 +1288,11 @@ int dsa_port_bridge_host_mdb_del(const struct dsa_port *dp,
 	if (!dp->ds->fdb_isolation)
 		db.bridge.num = 0;
 
-	err = dev_mc_del(conduit, mdb->addr);
+	err = dsa_port_host_mdb_del(dp, mdb, db);
 	if (err)
 		return err;
 
-	return dsa_port_host_mdb_del(dp, mdb, db);
+	return dev_mc_del(conduit, mdb->addr);
 }
 
 int dsa_port_vlan_add(struct dsa_port *dp,
