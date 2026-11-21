@@ -16,6 +16,7 @@
 #include <linux/ipv6.h>
 #include <linux/slab.h>
 #include <net/checksum.h>
+#include <net/dsa.h>
 #include <net/ip6_checksum.h>
 #include <linux/etherdevice.h>
 #include <linux/ethtool.h>
@@ -4921,9 +4922,25 @@ void ixgbe_set_rx_mode(struct net_device *netdev)
 {
 	struct ixgbe_adapter *adapter = netdev_priv(netdev);
 	struct ixgbe_hw *hw = &adapter->hw;
-	u32 fctrl, vmolr = IXGBE_VMOLR_BAM | IXGBE_VMOLR_AUPE;
+	u32 fctrl, hlreg0, vmolr = IXGBE_VMOLR_BAM | IXGBE_VMOLR_AUPE;
 	netdev_features_t features = netdev->features;
 	int count;
+
+	/* Switch tags can occupy the length field or extend an 802.3 frame.
+	 * Suppress only the resulting length errors, retaining other checks.
+	 */
+	hlreg0 = IXGBE_READ_REG(hw, IXGBE_HLREG0);
+	if (netdev_uses_dsa(netdev)) {
+		if (hlreg0 & IXGBE_HLREG0_RXLNGTHERREN) {
+			adapter->dsa_rx_len_check_disabled = true;
+			hlreg0 &= ~IXGBE_HLREG0_RXLNGTHERREN;
+			IXGBE_WRITE_REG(hw, IXGBE_HLREG0, hlreg0);
+		}
+	} else if (adapter->dsa_rx_len_check_disabled) {
+		hlreg0 |= IXGBE_HLREG0_RXLNGTHERREN;
+		IXGBE_WRITE_REG(hw, IXGBE_HLREG0, hlreg0);
+		adapter->dsa_rx_len_check_disabled = false;
+	}
 
 	/* Check for Promiscuous and All Multicast modes */
 	fctrl = IXGBE_READ_REG(hw, IXGBE_FCTRL);
