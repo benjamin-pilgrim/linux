@@ -16,6 +16,17 @@ menuconfig NET_DSA
 
 if NET_DSA
 
+config NET_DSA_FWNODE_KUNIT_TEST
+	bool "KUnit tests for firmware-described DSA switches" if !KUNIT_ALL_TESTS
+	depends on KUNIT=y && NET_DSA=y
+	select NET_DSA_TAG_NONE
+	default KUNIT_ALL_TESTS
+	help
+	  Register a synthetic DSA switch described by software nodes.
+	  Test CPU conduit lookup, user interface creation, invalid port
+	  descriptions and recovery after failed switch setup. No physical
+	  switch or network connection is required.
+
 # Drivers must select the appropriate tagging format(s)
 
 config NET_DSA_TAG_NONE
