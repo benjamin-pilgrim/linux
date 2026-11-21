@@ -2,6 +2,7 @@
 /* Copyright(c) 1999 - 2024 Intel Corporation. */
 
 #include <linux/pci.h>
+#include <linux/iopoll.h>
 #include <linux/delay.h>
 #include <linux/sched.h>
 #include <linux/netdevice.h>
@@ -3627,6 +3628,7 @@ int ixgbe_hic_unlocked(struct ixgbe_hw *hw, u32 *buffer, u32 length,
 {
 	u32 hicr, i, fwsts;
 	u16 dword_len;
+	int err;
 
 	if (!length || length > IXGBE_HI_MAX_BLOCK_BYTE_LENGTH) {
 		hw_dbg(hw, "Buffer length failure buffersize-%d.\n", length);
@@ -3662,16 +3664,18 @@ int ixgbe_hic_unlocked(struct ixgbe_hw *hw, u32 *buffer, u32 length,
 	/* Setting this bit tells the ARC that a new command is pending. */
 	IXGBE_WRITE_REG(hw, IXGBE_HICR, hicr | IXGBE_HICR_C);
 
-	for (i = 0; i < timeout; i++) {
-		hicr = IXGBE_READ_REG(hw, IXGBE_HICR);
-		if (!(hicr & IXGBE_HICR_C))
-			break;
-		usleep_range(1000, 2000);
+	/* A zero timeout requests submission without waiting for completion. */
+	if (timeout) {
+		err = read_poll_timeout(IXGBE_READ_REG, hicr,
+					!(hicr & IXGBE_HICR_C), 10,
+					(u64)timeout * USEC_PER_MSEC, false,
+					hw, IXGBE_HICR);
+		if (err)
+			return -EIO;
 	}
 
 	/* Check command successful completion. */
-	if ((timeout && i == timeout) ||
-	    !(IXGBE_READ_REG(hw, IXGBE_HICR) & IXGBE_HICR_SV))
+	if (!(IXGBE_READ_REG(hw, IXGBE_HICR) & IXGBE_HICR_SV))
 		return -EIO;
 
 	return 0;
