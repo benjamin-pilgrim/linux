@@ -6031,8 +6031,10 @@ static int ixgbe_non_sfp_link_config(struct ixgbe_hw *hw)
 		 * to accommodate broken network switches in the field
 		 * which cannot cope with advertised NBASE-T speeds
 		 */
-		speed &= ~(IXGBE_LINK_SPEED_5GB_FULL |
-			   IXGBE_LINK_SPEED_2_5GB_FULL);
+		if (hw->phy.media_type != ixgbe_media_type_backplane ||
+		    speed != IXGBE_LINK_SPEED_2_5GB_FULL)
+			speed &= ~(IXGBE_LINK_SPEED_5GB_FULL |
+				   IXGBE_LINK_SPEED_2_5GB_FULL);
 	}
 
 	if (ret)
