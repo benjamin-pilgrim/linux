@@ -16,6 +16,8 @@ menuconfig X86_PLATFORM_DEVICES
 
 if X86_PLATFORM_DEVICES
 
+source "drivers/platform/x86/watchguard/Kconfig"
+
 config HUAWEI_WMI
 	tristate "Huawei WMI laptop extras driver"
 	depends on ACPI_BATTERY

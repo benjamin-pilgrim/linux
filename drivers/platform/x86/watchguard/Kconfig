@@ -1,0 +1,67 @@
+# SPDX-License-Identifier: GPL-2.0-only
+config WATCHGUARD_PLATFORM
+	bool "WatchGuard board enumeration"
+	depends on X86_64 && PCI
+	help
+	  Identify WatchGuard boards through BIOS ROM markers or DMI.
+	  Recognition creates a board device without accessing I2C or Ethernet.
+	  Unsupported or missing firmware identities do not enable bus access.
+	  The enumerator leaves management and Ethernet drivers unclaimed.
+
+config WATCHGUARD_BOARD
+	tristate "WatchGuard manufacturing EEPROM support"
+	depends on WATCHGUARD_PLATFORM && I2C
+	depends on I2C_MUX_PCA954x
+	select CRC16
+	help
+	  Enable direct EEPROM reads on NCB-WG2511, MB-UP2010W, T55 and T70,
+	  and NCB-4210WG channel 3 through a PCA954x-compatible switch.
+	  Validate the manufacturing serial CRC before model-specific setup.
+	  Other recognised boards await a complete controller/mux description.
+
+	  The module is called watchguard-board.
+
+config NCB_WG2511_PANEL
+	tristate "WatchGuard Firebox M270 front panel"
+	depends on WATCHGUARD_BOARD && GPIOLIB
+	help
+	  Describe the M270 Guard LED and polled Reset button using native
+	  leds-gpio and gpio-keys-polled consumers after identity validation.
+	  The NCT6776 GPIO7 provider in gpio-f7188x is required. Panel setup
+	  waits for that provider independently of network-driver readiness.
+
+	  The module is called ncb-wg2511-panel.
+
+config NCB_WG2511_DSA
+	tristate "WatchGuard Firebox M270 Ethernet switch"
+	depends on WATCHGUARD_BOARD && NET_DSA_MV88E6XXX
+	help
+	  Register the M270 switch using software nodes after manufacturing
+	  identity and PCI/MDIO verification. Describe eight user ports,
+	  their PHYs and two fixed 2.5G CPU links. Network policy belongs
+	  to userspace. M370 Ethernet remains enumerated by PCI.
+
+	  The module is called ncb-wg2511-switch.
+
+config WATCHGUARD_KUNIT_TEST
+	bool "WatchGuard board and manufacturing tests" if !KUNIT_ALL_TESTS
+	depends on KUNIT=y && WATCHGUARD_BOARD=y
+	default KUNIT_ALL_TESTS
+	help
+	  Test board identification, PCI controller selection and EEPROM routes
+	  through an in-memory PCI fabric and synthetic SMBus adapters,
+	  including standard PCA954x channel selection.
+	  Cover CRC validation, transfer failures, address ownership and
+	  mux-driver removal/rebind without requiring an appliance.
+
+config WATCHGUARD_M270_KUNIT_TEST
+	bool "WatchGuard M270 model enumeration tests" if !KUNIT_ALL_TESTS
+	depends on KUNIT=y && WATCHGUARD_BOARD=y && NCB_WG2511_PANEL=y
+	depends on LEDS_GPIO=y && KEYBOARD_GPIO_POLLED=y
+	default KUNIT_ALL_TESTS
+	help
+	  Test model child enumeration, GPIO LED wiring and polled button
+	  events through native consumer drivers and a synthetic GPIO chip.
+	  Check panel availability without NIC suppliers, GPIO-provider deferral
+	  and consumer cleanup on identity-consumer or supplier removal and rebind.
+	  Run with synthetic hardware in an isolated virtual machine.
