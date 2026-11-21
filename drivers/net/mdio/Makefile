@@ -3,6 +3,7 @@
 
 obj-$(CONFIG_ACPI_MDIO)		+= acpi_mdio.o
 obj-$(CONFIG_FWNODE_MDIO)	+= fwnode_mdio.o
+obj-$(CONFIG_FWNODE_MDIO_KUNIT_TEST) += fwnode_mdio_test.o
 obj-$(CONFIG_OF_MDIO)		+= of_mdio.o
 
 obj-$(CONFIG_MDIO_AIROHA)		+= mdio-airoha.o

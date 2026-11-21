@@ -11,6 +11,17 @@ config FWNODE_MDIO
 	help
 	  FWNODE MDIO bus (Ethernet PHY) accessors
 
+config FWNODE_MDIO_KUNIT_TEST
+	tristate "Firmware-node MDIO tests" if !KUNIT_ALL_TESTS
+	depends on KUNIT
+	select FWNODE_MDIO
+	default KUNIT_ALL_TESTS
+	help
+	  Test firmware-described PHY registration using a synthetic MDIO bus.
+	  Check firmware-node lookup, preservation of occupied addresses, and
+	  retry after failed bus reads.
+	  These tests do not require physical networking hardware.
+
 config OF_MDIO
 	def_tristate OF
 	select FIXED_PHY
