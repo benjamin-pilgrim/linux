@@ -45,7 +45,7 @@ fwnode_find_mii_timestamper(struct fwnode_handle *fwnode)
 	struct of_phandle_args arg;
 	int err;
 
-	if (is_acpi_node(fwnode))
+	if (!is_of_node(fwnode))
 		return NULL;
 
 	err = of_parse_phandle_with_fixed_args(to_of_node(fwnode),
@@ -153,7 +153,7 @@ int fwnode_mdiobus_register_phy(struct mii_bus *bus,
 			fwnode_handle_put(child);
 			goto clean_phy;
 		}
-	} else if (is_of_node(child)) {
+	} else {
 		rc = fwnode_mdiobus_phy_device_register(bus, phy, child, addr);
 		if (rc)
 			goto clean_phy;
@@ -177,8 +177,7 @@ int fwnode_mdiobus_register_phy(struct mii_bus *bus,
 	return 0;
 
 unregister_phy:
-	if (is_acpi_node(child) || is_of_node(child))
-		phy_device_remove(phy);
+	phy_device_remove(phy);
 clean_phy:
 	phy_device_free(phy);
 clean_mii_ts:
