@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /* Register a synthetic switch through the public DSA interface. */
 #include <kunit/test.h>
+#include <linux/completion.h>
+#include <linux/kthread.h>
 #include <linux/user_namespace.h>
 #include <linux/etherdevice.h>
 #include <linux/platform_device.h>
@@ -14,12 +16,15 @@ struct dsa_fwnode_fixture {
 	struct device *parent[2];
 	struct net_device *nic[3];
 	struct software_node identity[2];
-	struct software_node node[8];
-	const struct software_node *nodes[9];
+	struct software_node node[9];
+	const struct software_node *nodes[10];
 	struct software_node_ref_args ref[2][1];
 	struct property_entry cpu_props[2][4];
 	struct dsa_switch ds;
 	struct net *net;
+	bool incomplete;
+	struct software_node_ref_args absent_ref[1];
+	struct property_entry link_props[3];
 	bool nodes_registered;
 	bool switch_registered;
 	int setup_error;
@@ -34,8 +39,10 @@ static void dsa_fwnode_cleanup(void *data)
 	struct dsa_fwnode_fixture *f = data;
 	int i;
 
-	if (f->switch_registered)
+	if (f->switch_registered) {
 		dsa_unregister_switch(&f->ds);
+		f->switch_registered = false;
+	}
 	if (f->nodes_registered) {
 		device_set_node(&f->pdev->dev, NULL);
 		software_node_unregister_node_group(f->nodes);
@@ -45,12 +52,13 @@ static void dsa_fwnode_cleanup(void *data)
 			continue;
 		unregister_netdev(f->nic[i]);
 		free_netdev(f->nic[i]);
+		f->nic[i] = NULL;
 	}
 	for (i = 0; i < ARRAY_SIZE(f->parent); i++) {
 		if (!f->parent[i])
 			continue;
 		device_remove_software_node(f->parent[i]);
-		root_device_unregister(f->parent[i]);
+		platform_device_unregister(to_platform_device(f->parent[i]));
 	}
 	if (!IS_ERR_OR_NULL(f->net))
 		put_net(f->net);
@@ -110,25 +118,67 @@ static int dsa_fwnode_probe(struct platform_device *pdev)
 	return 0;
 }
 
+static void dsa_fwnode_remove(struct platform_device *pdev)
+{
+	struct dsa_fwnode_fixture *f = platform_get_drvdata(pdev);
+
+	if (f && f->switch_registered) {
+		dsa_unregister_switch(&f->ds);
+		f->switch_registered = false;
+	}
+}
+
+static void dsa_fwnode_nic_remove(struct platform_device *pdev)
+{
+	struct dsa_fwnode_fixture *f = platform_get_drvdata(pdev);
+	int i;
+
+	if (!f)
+		return;
+	for (i = 0; i < ARRAY_SIZE(f->nic); i++) {
+		if (!f->nic[i] || f->nic[i]->dev.parent != &pdev->dev)
+			continue;
+		unregister_netdev(f->nic[i]);
+		free_netdev(f->nic[i]);
+		f->nic[i] = NULL;
+	}
+}
+
+static struct platform_driver dsa_fwnode_nic_driver = {
+	.probe = dsa_fwnode_probe,
+	.remove = dsa_fwnode_nic_remove,
+	.driver.name = "dsa-fwnode-nic",
+};
+
 static struct platform_driver dsa_fwnode_driver = {
 	.probe = dsa_fwnode_probe,
+	.remove = dsa_fwnode_remove,
 	.driver.name = "dsa-fwnode-test",
 };
 
 static int dsa_fwnode_suite_init(struct kunit_suite *suite)
 {
-	return platform_driver_register(&dsa_fwnode_driver);
+	int err = platform_driver_register(&dsa_fwnode_nic_driver);
+
+	if (err)
+		return err;
+	err = platform_driver_register(&dsa_fwnode_driver);
+	if (err)
+		platform_driver_unregister(&dsa_fwnode_nic_driver);
+	return err;
 }
 
 static void dsa_fwnode_suite_exit(struct kunit_suite *suite)
 {
 	platform_driver_unregister(&dsa_fwnode_driver);
+	platform_driver_unregister(&dsa_fwnode_nic_driver);
 }
 
 static int dsa_fwnode_init(struct kunit *test)
 {
 	static const char * const names[] = { "dsa-fw-lan0", "dsa-fw-lan1" };
 	struct dsa_fwnode_fixture *f;
+	struct platform_device *parent;
 	int i, err;
 
 	f = kunit_kzalloc(test, sizeof(*f), GFP_KERNEL);
@@ -138,16 +188,19 @@ static int dsa_fwnode_init(struct kunit *test)
 	f->pdev = platform_device_register_simple("dsa-fwnode-test", -1, NULL, 0);
 	if (IS_ERR(f->pdev))
 		return PTR_ERR(f->pdev);
+	platform_set_drvdata(f->pdev, f);
 	err = kunit_add_action_or_reset(test, dsa_fwnode_cleanup, f);
 	if (err)
 		return err;
 	for (i = 0; i < 2; i++) {
-		f->parent[i] = root_device_register(names[i]);
+		parent = platform_device_register_simple("dsa-fwnode-nic", i, NULL, 0);
+		f->parent[i] = IS_ERR(parent) ? ERR_CAST(parent) : &parent->dev;
 		if (IS_ERR(f->parent[i])) {
 			err = PTR_ERR(f->parent[i]);
 			f->parent[i] = NULL;
 			return err;
 		}
+		dev_set_drvdata(f->parent[i], f);
 		f->identity[i].name = names[i];
 		err = device_add_software_node(f->parent[i], &f->identity[i]);
 		if (err)
@@ -213,6 +266,14 @@ static int dsa_fwnode_topology(struct dsa_fwnode_fixture *f, bool second_only,
 		f->nodes[n++] = cpu;
 		if (!f->omit_cpu_fixed)
 			f->nodes[n++] = fixed;
+	}
+	if (f->incomplete) {
+		f->node[8].name = "absent-fabric-port";
+		f->nodes[n++] = &f->node[8];
+		f->absent_ref[0] = SOFTWARE_NODE_REFERENCE(&f->node[8]);
+		f->link_props[0] = PROPERTY_ENTRY_U32("reg", 0);
+		f->link_props[1] = PROPERTY_ENTRY_REF_ARRAY("link", f->absent_ref);
+		f->node[2].properties = f->link_props;
 	}
 	err = software_node_register_node_group(f->nodes);
 	if (err)
@@ -380,8 +441,49 @@ static void dsa_fwnode_conduit_in_other_netns(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, dsa_fwnode_register(f), 0);
 }
 
+struct dsa_unregister_work {
+	struct completion done;
+	struct device *supplier;
+};
+
+static int dsa_fwnode_unregister_nic(void *data)
+{
+	struct dsa_unregister_work *work = data;
+
+	device_release_driver(work->supplier);
+	complete(&work->done);
+	return 0;
+}
+
+/* An incomplete fabric must not indefinitely prevent its MAC unregistering. */
+static void dsa_fwnode_incomplete_tree_unregister(struct kunit *test)
+{
+	struct dsa_fwnode_fixture *f = test->priv;
+	struct dsa_unregister_work work;
+	struct task_struct *task;
+	unsigned long completed;
+
+	f->incomplete = true;
+	KUNIT_ASSERT_EQ(test, dsa_fwnode_topology(f, false, false), 0);
+	KUNIT_ASSERT_EQ(test, dsa_fwnode_register(f), 0);
+	init_completion(&work.done);
+	work.supplier = f->parent[0];
+	task = kthread_run(dsa_fwnode_unregister_nic, &work, "dsa-unregister-test");
+	KUNIT_ASSERT_FALSE(test, IS_ERR(task));
+	completed = wait_for_completion_timeout(&work.done, msecs_to_jiffies(1500));
+	KUNIT_EXPECT_NE_MSG(test, completed, 0,
+			    "NIC unregister waited for explicit switch removal");
+
+	/* Recover even on the broken kernel, rather than leave a stuck worker. */
+	device_release_driver(&f->pdev->dev);
+	if (!completed && !wait_for_completion_timeout(&work.done,
+						       msecs_to_jiffies(10000)))
+		panic("DSA regression fixture could not recover NIC unregister");
+}
+
 static struct kunit_case dsa_fwnode_cases[] = {
 	KUNIT_CASE(dsa_fwnode_conduit_in_other_netns),
+	KUNIT_CASE(dsa_fwnode_incomplete_tree_unregister),
 	KUNIT_CASE(dsa_fwnode_registers_ports),
 	KUNIT_CASE(dsa_fwnode_survives_rename),
 	KUNIT_CASE(dsa_fwnode_rejects_missing_link),

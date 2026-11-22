@@ -1309,6 +1309,18 @@ static int dsa_port_parse_fwnode(struct dsa_port *dp,
 			return PTR_ERR(conduit);
 		}
 
+		/*
+		 * Firmware describes a physical MAC. LAG conduits are created
+		 * later from netdevice events. Establish removal ordering before
+		 * an incomplete routing tree can retain the MAC.
+		 */
+		if (netif_is_lag_master(conduit) || !conduit->dev.parent ||
+		    !device_link_add(dp->ds->dev, conduit->dev.parent,
+				     DL_FLAG_AUTOREMOVE_CONSUMER)) {
+			rtnl_unlock();
+			return -EINVAL;
+		}
+
 		netdev_hold(conduit, &dp->conduit_tracker, GFP_KERNEL);
 		rtnl_unlock();
 
