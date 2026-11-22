@@ -7,6 +7,7 @@ endif
 
 # the core
 obj-$(CONFIG_NET_DSA) += dsa_core.o
+obj-$(CONFIG_NET_DSA_FWNODE_KUNIT_TEST) += fwnode_test.o
 dsa_core-y += \
 	conduit.o \
 	devlink.o \
